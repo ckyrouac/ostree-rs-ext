@@ -32,6 +32,7 @@ pub mod globals;
 mod isolation;
 
 pub mod bootabletree;
+pub mod bootc;
 pub mod cli;
 pub mod container;
 pub mod container_utils;

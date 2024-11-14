@@ -6,11 +6,13 @@ use cap_std_ext::cmdext::CapStdExtCommandExt;
 use containers_image_proxy::oci_spec::image as oci_image;
 use fn_error_context::context;
 use io_lifetimes::OwnedFd;
+use rustix::path::Arg;
 use serde::Deserialize;
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
 use std::str::FromStr;
+use std::collections::HashMap;
 use tokio::process::Command;
 
 // See `man containers-policy.json` and
@@ -60,6 +62,47 @@ pub(crate) fn new_cmd() -> std::process::Command {
 pub(crate) fn spawn(mut cmd: Command) -> Result<tokio::process::Child> {
     let cmd = cmd.stdin(Stdio::null()).stderr(Stdio::piped());
     cmd.spawn().context("Failed to exec skopeo")
+}
+
+/// Use skopeo to inspect an image for it's labels.
+#[context("Skopeo inspect")]
+pub(crate) async fn labels(
+    img: &ImageReference,
+    authfile: Option<&Path>,
+) -> Result<HashMap<String, String>> {
+    let mut cmd = new_cmd();
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd.arg("inspect");
+    cmd.arg("--format");
+    cmd.arg("{{json .Labels}}");
+    cmd.arg(img.to_string());
+
+    if let Some(authfile) = authfile {
+        cmd.arg("--authfile");
+        cmd.arg(authfile);
+    }
+
+    let mut cmd = tokio::process::Command::from(cmd);
+    cmd.kill_on_drop(true);
+    let proc = super::skopeo::spawn(cmd)?;
+    let output = proc.wait_with_output().await?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow::anyhow!("skopeo inspect failed: {}\n", stderr));
+    }
+
+    let output_json = String::from_utf8_lossy(&output.stdout);
+    let result: serde_json::Value = serde_json::from_str(output_json.as_str()?)?;
+
+    let map: HashMap<String, String> = result.as_object()
+        .expect("Expected a JSON object")
+        .iter()
+        .map(|(k, v)| (k.clone(), v.as_str().expect("Expected a string").to_string()))
+        .collect();
+
+    Ok(map)
 }
 
 /// Use skopeo to copy a container image.
@@ -152,5 +195,13 @@ mod tests {
             let p: ContainerPolicy = serde_json::from_str(v).unwrap();
             assert!(!p.is_default_insecure());
         }
+    }
+
+    #[tokio::test]
+    async fn label_test() {
+        let img = ImageReference::try_from("docker://quay.io/centos-bootc/centos-bootc:stream9");
+        let lbls = labels(&img.unwrap(), None).await;
+        let lbls_hash = lbls.unwrap_or_else(|e| panic!("Failed to get labels: {}", e));
+        assert!(lbls_hash.contains_key("containers.bootc"))
     }
 }

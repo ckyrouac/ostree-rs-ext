@@ -25,6 +25,8 @@ use std::path::PathBuf;
 use std::process::Command;
 use tokio::sync::mpsc::Receiver;
 
+use crate::bootc;
+use crate::container::skopeo;
 use crate::chunking::{ObjectMetaSized, ObjectSourceMetaSized};
 use crate::commit::container_commit;
 use crate::container::store::{ExportToOCIOpts, ImportProgress, LayerProgress, PreparedImport};
@@ -1257,13 +1259,14 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                     // As of recent releases, signature verification enforcement is
                     // off by default, and must be explicitly enabled.
                     no_signature_verification = !enforce_container_sigpolicy;
-                    let sysroot = &if let Some(sysroot) = sysroot {
+                    let sysroot_copy = sysroot.clone();
+                    let ostree_sysroot = &if let Some(sysroot) = sysroot {
                         ostree::Sysroot::new(Some(&gio::File::for_path(sysroot)))
                     } else {
                         ostree::Sysroot::new_default()
                     };
-                    sysroot.load(gio::Cancellable::NONE)?;
-                    let repo = &sysroot.repo();
+                    ostree_sysroot.load(gio::Cancellable::NONE)?;
+                    let repo = &ostree_sysroot.repo();
                     let kargs = karg.as_deref();
                     let kargs = kargs.map(|v| {
                         let r: Vec<_> = v.iter().map(|s| s.as_str()).collect();
@@ -1271,12 +1274,13 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                     });
 
                     // If the user specified a stateroot, we always use that.
+                    let stateroot_copy = stateroot.clone();
                     let stateroot = if let Some(stateroot) = stateroot.as_deref() {
                         Cow::Borrowed(stateroot)
                     } else {
                         // Otherwise, if we're booted via ostree, use the booted.
                         // If that doesn't hold, then use `default`.
-                        let booted_stateroot = sysroot
+                        let booted_stateroot = ostree_sysroot
                             .booted_deployment()
                             .map(|d| Cow::Owned(d.osname().to_string()));
                         booted_stateroot.unwrap_or({
@@ -1306,31 +1310,44 @@ async fn run_from_opt(opt: Opt) -> Result<()> {
                         imgref.as_str().try_into()?
                     };
 
-                    #[allow(clippy::needless_update)]
-                    let options = crate::container::deploy::DeployOpts {
-                        kargs: kargs.as_deref(),
-                        target_imgref: target_imgref.as_ref(),
-                        proxy_cfg: Some(proxyopts.into()),
-                        no_imgref,
-                        ..Default::default()
-                    };
-                    let state = crate::container::deploy::deploy(
-                        sysroot,
-                        &stateroot,
-                        &imgref,
-                        Some(options),
-                    )
-                    .await?;
-                    let wrote_imgref = target_imgref.as_ref().unwrap_or(&imgref);
-                    if let Some(msg) = ostree_container::store::image_filtered_content_warning(
-                        repo,
-                        &wrote_imgref.imgref,
-                    )? {
-                        eprintln!("{msg}")
-                    }
-                    if let Some(p) = write_commitid_to {
-                        std::fs::write(&p, state.merge_commit.as_bytes())
-                            .with_context(|| format!("Failed to write commitid to {}", p))?;
+                    // check for the presence of bootc label and bootc exe
+                    // if they are present, then run bootc install
+                    // else continue with deploy
+                    let img_labels = skopeo::labels(&imgref.imgref, None).await?;
+                    // if bootc::exe_exists()? && img_labels.contains_key("containers.bootc") {
+                    if img_labels.contains_key("containers.bootc") {
+                        println!("**** THIS IS A BOOTC IMAGE ****");
+                        // crate::bootc::install(&imgref.imgref, &sysroot, &stateroot)?;
+                        crate::bootc::install(&imgref.imgref, sysroot_copy.unwrap(), stateroot_copy.unwrap()).await?;
+                    } else {
+                        println!("**** NOT A BOOTC IMAGE ****");
+
+                        #[allow(clippy::needless_update)]
+                        let options = crate::container::deploy::DeployOpts {
+                            kargs: kargs.as_deref(),
+                            target_imgref: target_imgref.as_ref(),
+                            proxy_cfg: Some(proxyopts.into()),
+                            no_imgref,
+                            ..Default::default()
+                        };
+                        let state = crate::container::deploy::deploy(
+                            ostree_sysroot,
+                            &stateroot,
+                            &imgref,
+                            Some(options),
+                        )
+                        .await?;
+                        let wrote_imgref = target_imgref.as_ref().unwrap_or(&imgref);
+                        if let Some(msg) = ostree_container::store::image_filtered_content_warning(
+                            repo,
+                            &wrote_imgref.imgref,
+                        )? {
+                            eprintln!("{msg}")
+                        }
+                        if let Some(p) = write_commitid_to {
+                            std::fs::write(&p, state.merge_commit.as_bytes())
+                                .with_context(|| format!("Failed to write commitid to {}", p))?;
+                        }
                     }
                     Ok(())
                 }
